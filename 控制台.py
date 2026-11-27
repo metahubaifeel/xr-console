@@ -12,11 +12,12 @@
   · 停止回零、实时日志
 
 原理
-  通过用户配置的 Portainer API 在 client 容器里 exec，
+  走官方 Portainer API (admin/xsquarerobot) 在 client 容器里 exec，
   不需要 SSH。相机用 v4l2 直采 MJPG（免转码）。
 
 用法
-  python3 控制台.py --ip <机器人IP> --host 127.0.0.1 --port 8900
+  python3 控制台.py                 # 默认 10.230.20.13:8900
+  python3 控制台.py --ip 10.230.20.13 --port 8900
 """
 
 import argparse
@@ -36,13 +37,13 @@ from scan_flow import ScanFlow
 _robot_http = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 # ---------------- 配置 ----------------
-ROBOT_IP = os.environ.get("ROBOT_IP", "127.0.0.1")
+ROBOT_IP = "10.230.20.13"
 PORTAINER_PORT = 9000
-ENDPOINT_ID = int(os.environ.get("PORTAINER_ENDPOINT_ID", "3"))
-CONTAINER_ID = os.environ.get("ROBOT_CLIENT_CONTAINER", "ex001_client-robot_client-1")
+ENDPOINT_ID = 3
+CONTAINER_ID = "05c14da94c70"       # ex001_client-robot_client-1
 PERCEPTION_CID = ""                # ex001_client-robot_perception_ops-1（启动时自动查）
-PORTAINER_USER = os.environ.get("PORTAINER_USER", "admin")
-PORTAINER_PASS = os.environ.get("PORTAINER_PASS", "")
+PORTAINER_USER = "admin"
+PORTAINER_PASS = "xsquarerobot"
 LOG_PATH = "/tmp/l0.log"
 HELPER = "/tmp/d3.sh"
 STOP_SH = "/tmp/stop.sh"
@@ -381,7 +382,22 @@ echo $! > "$PIDF"
 '''
 
 _STOP_SH = r'''#!/bin/bash
-# 1) 停掉推理会话
+# 只停会话，不动手臂（方便人先取下手里的东西）
+PAT='start_ex001[.]py'
+if pgrep -f "$PAT" >/dev/null; then
+  kill $(pgrep -f "$PAT") 2>/dev/null
+  for i in $(seq 1 12); do pgrep -f "$PAT" >/dev/null || break; sleep 1; done
+  pkill -9 -f "$PAT" 2>/dev/null
+  echo "会话已停止（手臂保持原位，夹爪保持开合）"
+else
+  echo "没有正在跑的会话"
+fi
+rm -f /tmp/xr.pid
+'''
+
+
+_HOME_SH = r'''#!/bin/bash
+# 停止会话 + 正规归零
 PAT='start_ex001[.]py'
 if pgrep -f "$PAT" >/dev/null; then
   kill $(pgrep -f "$PAT") 2>/dev/null
@@ -390,13 +406,12 @@ if pgrep -f "$PAT" >/dev/null; then
 fi
 rm -f /tmp/xr.pid
 sleep 1
-# 2) 走官方 zero_arm 正规归零（controller mode 11）
 source /opt/xr/bot/x2robot_client/share/x2robot_client/scripts/session_env.sh >/dev/null 2>&1
 OUT=$(python3 -m x2robot_client.zero_arm --timeout 90 2>&1)
 if echo "$OUT" | grep -q "homing complete"; then
-  echo "已停止，双臂归零完成"
+  echo "已归零（注意：夹爪里的东西还在）"
 else
-  echo "已停止，但归零未确认："
+  echo "归零未确认："
   echo "$OUT" | tail -3
 fi
 '''
@@ -406,7 +421,7 @@ def ensure_scripts():
     if not KEY:
         return "⚠️ 没读到 WALLX_API_KEY"
     parts = []
-    for path, body in ((HELPER, _D3_SH.replace("__KEY__", KEY)), (STOP_SH, _STOP_SH)):
+    for path, body in ((HELPER, _D3_SH.replace("__KEY__", KEY)), (STOP_SH, _STOP_SH), ("/tmp/home.sh", _HOME_SH)):
         b = base64.b64encode(body.encode()).decode()
         parts.append(f"echo '{b}' | base64 -d > {path} && chmod +x {path}")
     return shell_text(" && ".join(parts) + " && bash -n /tmp/d3.sh && echo '脚本就绪'").strip()
@@ -976,10 +991,13 @@ details>summary{cursor:pointer;color:#b7c8dd;font-weight:600;padding:4px 0}detai
 </style></head><body>
 <header>
   <h1>BRIGHT / 扫码分拣工作台</h1>
-  <span class=tag>量子1号 Pro · 本地控制台</span>
+  <span class=tag>10.230.20.13 · ex001-655 · 工位27</span>
   <span class=tag id=st>状态检测中…</span>
   <span class=tag id=gr>夹爪 -- / --</span>
-  <button class=stop onclick="stopIt()">■ 停止 &amp; 回零</button>
+  <a href="/twin" target=_blank style="margin-left:auto;color:#8fc2ff;text-decoration:none;
+     border:1px solid #2e3543;border-radius:9px;padding:8px 14px;font-size:13px">🧊 3D 孪生</a>
+  <button class=ghost onclick="stopOnly()">■ 停止（臂不动）</button>
+  <button class=stop onclick="stopIt()">⌂ 停止 + 归零</button>
   <button onclick="holdStop()">停止推理（不归零）</button>
 </header>
 <div class=wrap>
@@ -1167,7 +1185,8 @@ async function editRules(){
 }
 scanTick();
 
-async function stopIt(){msg('停止中…');const d=await post('/stop',{});msg((d.ok?'✅ ':'❌ ')+(d.message||''));setTimeout(refresh,400);}
+async function stopIt(){msg('停止并归零中…');const d=await post('/home',{});msg((d.ok?'✅ ':'❌ ')+(d.message||''));setTimeout(refresh,600);}
+async function stopOnly(){msg('停止中…');const d=await post('/stop',{});msg((d.ok?'✅ ':'❌ ')+(d.message||''));setTimeout(refresh,400);}
 async function refresh(){
   try{
     const d = await (await fetch('/state')).json();
@@ -1293,6 +1312,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, json.dumps({"ok": False, "message": "指令为空"}))
                 self._send(200, json.dumps({"ok": True, "message": run_instruction(instr, data.get("mode") or "full", bool(data.get("use_agent")))},
                                            ensure_ascii=False))
+            elif self.path == "/home":
+                self._send(200, json.dumps({"ok": True, "message": home_all()},
+                                           ensure_ascii=False))
             elif self.path == "/scan_rules":
                 save_rules({"default": data.get("default", ""),
                             "map": data.get("map", {})})
@@ -1375,14 +1397,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ip", default=ROBOT_IP)
     ap.add_argument("--port", type=int, default=8900)
-    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--host", default="0.0.0.0")
     a = ap.parse_args()
     ROBOT_IP = a.ip
     _ep = f"http://{ROBOT_IP}:{PORTAINER_PORT}/api"
 
     print("=" * 60)
     print("  🍭 超级棒棒糖 · 量子1号 Pro 通用控制台")
-    print(f"  机器人  {ROBOT_IP}")
+    print(f"  机器人  {ROBOT_IP}  (ex001-655 / 工位27)")
     print(f"  打开    http://localhost:{a.port}")
     print("=" * 60)
     def startup_checks():

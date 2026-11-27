@@ -104,6 +104,7 @@ def main():
     ap.add_argument('--device', action='append', help='指定设备，可多次')
     ap.add_argument('--list', action='store_true')
     ap.add_argument('--all', action='store_true', help='监听所有设备（默认只监听非键盘核心设备）')
+    ap.add_argument('--daemon', action='store_true', help='静默常驻，只写 /tmp/last_scan.json')
     a = ap.parse_args()
 
     devs = list_devices()
@@ -128,10 +129,11 @@ def main():
         print('没找到可监听的设备，用 --list 看看', file=sys.stderr)
         return
 
-    print('监听设备:')
-    for p, n in targets:
-        print(f'  {p}  {n}')
-    print('\n>>> 现在扫一次码（Ctrl-C 退出）\n')
+    if not a.daemon:
+        print('监听设备:')
+        for p, n in targets:
+            print(f'  {p}  {n}')
+        print('\n>>> 现在扫一次码（Ctrl-C 退出）\n')
 
     files = {}
     for p, n in targets:
@@ -143,9 +145,14 @@ def main():
     try:
         for name, code in decode(files, None):
             ts = time.strftime('%H:%M:%S')
-            print(f'[{ts}] {name}  CODE="{code}"')
+            if not a.daemon:
+                print(f'[{ts}] {name}  CODE="{code}"')
             with open('/tmp/scan.log', 'a') as f:
                 f.write(f'{ts}\t{code}\n')
+            import json as _j
+            with open('/tmp/last_scan.json', 'w') as f:
+                _j.dump({'code': code, 'ts': time.time(),
+                         'time': ts, 'device': name}, f, ensure_ascii=False)
     except KeyboardInterrupt:
         print('\n结束')
 
