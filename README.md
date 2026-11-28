@@ -37,3 +37,21 @@ python3 控制台.py --ip <机器人IP> --host 127.0.0.1 --port 8900
 控制台.py 为网页与机器人接口；robot_api.py 为机器人侧预览服务；scan_flow.py 为单轮编排；扫码枪.py 为 HID 监听；scan_rules.json 为条码映射。API Key 留在 api.env，不应分发。
 
 项目原创代码采用 MIT License。机器人固件、模型服务和第三方资产的授权不包含在本项目许可证中。
+
+## macOS 通过 SSH 启动
+
+```bash
+./start-mac.sh
+```
+
+默认连接 `xr@10.230.20.13`，首次提示时输入 SSH 密码（脚本不保存密码）。
+可通过 `ROBOT_IP`、`ROBOT_SSH_USER`、`PORT` 调整连接。SSH 连接复用保留 8 小时，
+无需 Portainer 管理密码。浏览器访问 http://localhost:8900 。
+本机 macOS 不支持 Linux HID 扫码守护，演练流程可以运行；实体扫码仍需 Linux 输入设备。
+动作推理需要在 `api.env` 配置自己的 `WALLX_API_KEY` 后重启。
+
+腕部预览：页面提供相机 A/B，分别复用感知容器 `/tmp/wrist_a.jpg`、`/tmp/wrist_b.jpg`。图片超过 3 秒未更新或不完整时显示重试提示，不重新占用摄像头；A/B 与左右手对应关系需现场确认。
+
+## 视觉执行监控 Harness
+
+运行 `./start-harness.sh`，访问 http://127.0.0.1:8910 。使用真实机器人、OpenAI视觉API与WALL-X VLA。前端支持独立测试每个步骤、五路实时预览、原始VLM JSON和单步结束停止。所有提示词位于 `harness/prompts/`，详细接口和使用方法见 `harness/README.md`。视觉Key保存在本地 `harness.env`。

@@ -1,0 +1,4 @@
+{
+  "execution_prompt": "Slowly move the scanner up and down to align the scanning window with the barcode. Adjust distance and angle slightly if needed.",
+  "verification_prompt": null
+}

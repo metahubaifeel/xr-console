@@ -1,0 +1,4 @@
+{
+  "execution_prompt": "The target is a black T-shaped object. It has a wide, rounded head and a long, narrow handle extending from the center of the head. Pick it up",
+  "verification_prompt": "夹爪夹住扫码枪手柄，扫码枪完全离开桌面且夹持稳定。"
+}

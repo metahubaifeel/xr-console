@@ -1,0 +1,4 @@
+{
+  "execution_prompt": "Use the other arm to grasp the red cylindrical object with a black-and-white barcode on its side. Slowly rotate it around its long axis until the barcode directly faces the scanning window. Keep the scanner stationary.",
+  "verification_prompt": "另一只手已抓稳红色圆柱体，侧面的黑白条形码正对扫码枪的扫描窗口，扫码枪保持稳定不动。"
+}

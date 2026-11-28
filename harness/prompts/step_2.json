@@ -1,0 +1,4 @@
+{
+  "execution_prompt": "Keep holding the black T-shaped object securely. Slowly rotate the wrist until the long handle is horizontal and the wide rounded head is on the robot's left side.",
+  "verification_prompt": "黑色T字形物体手柄平行桌面，玻璃扫描窗口竖直朝机器人{opening_direction_zh}方，姿态稳定。"
+}

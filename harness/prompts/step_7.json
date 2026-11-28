@@ -1,0 +1,6 @@
+{
+  "execution_prompt": "Place the black T-shaped object at its initial position and orientation. Keep the holding gripper closed and the arm steady once the object rests on the table.",
+  "verification_prompt": "黑色T字形物体已按初始位置和姿态放稳，填写scanner_placed。",
+  "release_execution_prompt": "Open the holding gripper to release the black T-shaped object resting on the table. Return both arms to their initial positions, leaving the black T-shaped object and sorted bottle in place.",
+  "release_verification_prompt": "扫码枪恢复初始位置和姿态，双臂复位且夹爪空置，瓶子仍直立稳定地位于目标框内。"
+}

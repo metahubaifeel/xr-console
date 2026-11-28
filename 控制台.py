@@ -6,7 +6,7 @@
 浏览器打开 http://localhost:8900
 
 功能
-  · 实时画面：前方/桌面视角 + 头部视角（腕部相机被感知栈占用，暂不可取）
+  · 实时画面：前方/桌面视角 + 头部视角 + 双腕视角（复用感知栈图片）
   · 通用指令：任意英文 instruction 自由下发
   · 原子动作：把官方 33 个原子动作翻译成英文按钮，点一下就发
   · 停止回零、实时日志
@@ -43,6 +43,8 @@ CONTAINER_ID = os.environ.get("ROBOT_CLIENT_CONTAINER", "ex001_client-robot_clie
 PERCEPTION_CID = ""                # ex001_client-robot_perception_ops-1（启动时自动查）
 PORTAINER_USER = os.environ.get("PORTAINER_USER", "admin")
 PORTAINER_PASS = os.environ.get("PORTAINER_PASS", "")
+SSH_USER = os.environ.get("ROBOT_SSH_USER", "")
+SSH_CONTROL_PATH = os.environ.get("ROBOT_SSH_CONTROL_PATH", "")
 LOG_PATH = "/tmp/l0.log"
 HELPER = "/tmp/d3.sh"
 STOP_SH = "/tmp/stop.sh"
@@ -50,8 +52,10 @@ STOP_SH = "/tmp/stop.sh"
 # 相机：device -> 标签（实测可用的排前面）
 CAMS = {8: "头部前方 RGBD（看得到两只夹爪）",
         0: "BEV-1 机身旁（看全局避障）",
-        6: "BEV-2 机身旁（看全局避障）"}
-# 腕部相机 video2/4 被感知栈独占，取不到；video0 时好时坏，暂不展示
+        6: "BEV-2 机身旁（看全局避障）",
+        "wa": "腕部相机 A",
+        "wb": "腕部相机 B"}
+# 腕部画面复用感知容器现有 JPEG，不重新打开 video2/4。
 CAM_RES = {8: [(1280, 960), (1280, 720), (640, 480)],
            0: [(1600, 1200), (1280, 720)],
            6: [(1600, 1200), (1280, 720)]}
@@ -113,6 +117,20 @@ def _demux(raw):
 
 
 def _exec(cmd_list, detach=False, timeout=30, retries=2, cid=None):
+    if SSH_USER:
+        import shlex
+        remote = ["docker", "exec"] + (["-d"] if detach else []) + [cid or CONTAINER_ID] + cmd_list
+        args = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]
+        if SSH_CONTROL_PATH:
+            args += ["-o", "ControlPath=" + SSH_CONTROL_PATH]
+        args += [SSH_USER + "@" + ROBOT_IP, shlex.join(remote)]
+        try:
+            result = subprocess.run(args, capture_output=True, timeout=timeout)
+            if result.returncode:
+                return "[控制台错误] SSH: ".encode() + result.stderr
+            return result.stdout
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return f"[控制台错误] SSH: {exc}".encode()
     body = json.dumps({"Cmd": cmd_list, "AttachStdout": True,
                        "AttachStderr": True, "Tty": False}).encode()
     for attempt in range(1, retries + 1):
@@ -161,23 +179,18 @@ def _wrist_raw(dev):
     """腕部相机：从感知容器读常驻守护写下的最新 JPEG"""
     if not PERCEPTION_CID:
         return None
-    raw = shell(f"base64 -w0 {WRIST[dev]} 2>/dev/null", timeout=15, cid=PERCEPTION_CID)
-    if isinstance(raw, str):
-        raw = raw.encode()
-    if b"/9j/" not in raw:
-        return None
-    txt = raw.decode("utf-8", "replace")
-    i = txt.find("/9j/")
-    s2 = re.sub(r"[^A-Za-z0-9+/=]", "", txt[i:]).rstrip("=")
-    s2 += "=" * (-len(s2) % 4)
-    try:
-        data = base64.b64decode(s2)
-    except Exception:  # noqa: BLE001
-        return None
-    j = data.rfind(b"\xff\xd9")
-    if j < 0 or len(data) < 2000:
-        return None
-    return data[:j + 2]
+    # 使用现有订阅者生成的图片；过期/写入中的帧不作为实时画面返回。
+    code = (
+        "import os,sys,time; p=sys.argv[1]; "
+        "f=open(p,'rb'); st=os.fstat(f.fileno()); d=f.read(); "
+        "sys.stdout.buffer.write(d if time.time()-st.st_mtime < 3 "
+        "and d.startswith(bytes([255,216])) and d.endswith(bytes([255,217])) else b'')"
+    )
+    data = _exec(["python3", "-c", code, WRIST[dev]], timeout=5,
+                 retries=1, cid=PERCEPTION_CID)
+    if data and data.startswith(b"\xff\xd8") and data.endswith(b"\xff\xd9"):
+        return data
+    return None
 
 
 _cam_cache = {}
@@ -306,12 +319,57 @@ def push_params(mode="full", use_agent=False):
     return f"{m['label']} / {tag}"
 
 
-def run_instruction(instr, mode="full", use_agent=False):
-    tag = push_params(mode, use_agent)
+def run_instruction(instr, mode="full", use_agent=False, harness_hold=False, harness_session_id=None):
     safe = instr.replace("\\", "\\\\").replace('"', '\\"')
-    shell(f'setsid nohup bash {HELPER} "{safe}" > /tmp/d3_run.log 2>&1 < /dev/null &',
+    prefix = ''
+    if harness_hold:
+        import shlex
+        state = harness_bridge('status')
+        if not harness_session_id or state.get('session_id') != harness_session_id:
+            raise RuntimeError('hold policy/session mismatch before VLA launch')
+        harness_bridge('prepare',{'session_id':harness_session_id,'instruction':instr})
+        if mode != 'arms':
+            raise ValueError('harness overlay currently requires arms-only body control')
+        prefix = ('XR_HARNESS_HOLD_FILE=/tmp/xr-harness/hold_state.json '
+                  'XR_HARNESS_SESSION_ID=' + shlex.quote(state['session_id']) + ' ')
+    if harness_bridge('motor-status').get('active'):
+        raise RuntimeError('manual motor command is active')
+    tag = push_params(mode, use_agent)
+    shell(f'setsid nohup env {prefix}bash {HELPER} "{safe}" > /tmp/d3_run.log 2>&1 < /dev/null &',
           detach=True)
     return f"[{tag}] {instr}"
+
+
+def harness_bridge(operation, payload=None):
+    if operation.startswith('motor-'):
+        import shlex
+        op=operation[6:]
+        if op not in ('catalog','plan','move','cancel','status'):raise ValueError('unknown motor operation')
+        command=('source /opt/xr/bot/x2robot_client/share/x2robot_client/scripts/session_env.sh >/dev/null 2>&1; '
+                 'exec python3 /tmp/xr-harness/motor_control.py '+op+' '+shlex.quote(json.dumps(payload or {},ensure_ascii=False)))
+        raw=_exec(['bash','-lc',command],timeout=85 if op=='move' else 12,retries=1)
+        result=json.loads(raw.decode('utf-8').strip().splitlines()[-1])
+        if 'error' in result:
+            kind=ValueError if result['error']=='ValueError' else RuntimeError
+            raise kind(result.get('message',result['error']))
+        return result
+    if operation == 'instruction-update':
+        import shlex
+        command=('source /opt/xr/bot/x2robot_client/share/x2robot_client/scripts/session_env.sh >/dev/null 2>&1; '
+                 'exec python3 /tmp/xr-harness/update_instruction.py '+shlex.quote(json.dumps(payload,ensure_ascii=False)))
+        raw=_exec(['bash','-lc',command],timeout=10,retries=1)
+        result=json.loads(raw.decode('utf-8'))
+        if 'error' in result:
+            raise RuntimeError('instruction update: '+result.get('message',result['error']))
+        return result
+    args = ['python3', '/tmp/xr-harness/bridge.py', operation]
+    if payload is not None:
+        args.append(json.dumps(payload, ensure_ascii=False))
+    raw = _exec(args, timeout=10, retries=1)
+    result = json.loads(raw.decode('utf-8'))
+    if 'error' in result:
+        raise RuntimeError('hold bridge: ' + result.get('message', result['error']))
+    return result
 
 
 def stop_all():
@@ -506,6 +564,8 @@ def start_scanner():
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "扫码枪.py")
     if not os.path.exists(script):
         return "无 扫码枪.py"
+    if not sys.platform.startswith('linux'):
+        return '本机不支持 Linux HID 扫码守护（可使用演练流程）'
     for pid in os.listdir('/proc'):
         if not pid.isdigit():
             continue
@@ -1071,7 +1131,7 @@ function refreshCam(dev){
   const img = document.getElementById('img'+dev), ph = document.getElementById('ph'+dev);
   const n = new Image();
   n.onload = () => { img.src = n.src; img.style.display='block'; if(ph) ph.style.display='none'; setTimeout(()=>refreshCam(dev),dev===8?65:250); };
-  n.onerror = () => { if(ph) ph.textContent = '画面暂不可用，正在重试'; setTimeout(()=>refreshCam(dev),1500); };
+  n.onerror = () => { img.style.display='none'; if(ph) { ph.style.display='flex'; ph.textContent = '画面暂不可用，正在重试'; } setTimeout(()=>refreshCam(dev),1500); };
   n.src = '/snap?d=' + dev + '&t=' + Date.now();
 }
 CAMS.forEach(([dev]) => refreshCam(dev));
@@ -1212,13 +1272,29 @@ class Handler(BaseHTTPRequestHandler):
                         .replace("__MODES__", json.dumps(modes, ensure_ascii=False)))
             self._send(200, page, "text/html")
         elif self.path.startswith("/snap"):
-            m = re.search(r"[?&]d=(\d+)", self.path)
-            dev = int(m.group(1)) if m else 8
-            data = robot_get(f"/snap?d={dev}") or snapshot(dev)
+            from urllib.parse import parse_qs, urlsplit
+            value = parse_qs(urlsplit(self.path).query).get("d", ["8"])[0]
+            dev = value if value in WRIST else int(value) if value.isdecimal() else None
+            if dev not in CAMS:
+                return self._send(400, '{"error":"unknown camera"}')
+            data = _wrist_raw(dev) if dev in WRIST else (robot_get(f"/snap?d={dev}") or snapshot(dev))
             if not data:
                 self._send(404, b"", "image/jpeg")
             else:
                 self._send(200, data, "image/jpeg")
+        elif self.path == '/motors':
+            try:self._send(200,json.dumps(harness_bridge('motor-catalog')))
+            except Exception as exc:self._send(503,json.dumps({'error':str(exc)[:300]}))
+        elif self.path == '/client-status':
+            try:
+                self._send(200,json.dumps(harness_bridge('runtime-status')))
+            except Exception:
+                self._send(503,'{"error":"client status unavailable"}')
+        elif self.path in ('/capabilities', '/arm-lock'):
+            try:
+                self._send(200, json.dumps(harness_bridge('capabilities' if self.path == '/capabilities' else 'status')))
+            except Exception:
+                self._send(503, '{"arm_lock":false,"error":"hold bridge unavailable"}')
         elif self.path == "/video-health":
             self._send(200, robot_get('/health', timeout=2) or '{}')
         elif self.path == "/flow":
@@ -1276,7 +1352,15 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:  # noqa: BLE001
             data = {}
         try:
-            if self.path == "/flow/start":
+            if self.path in ('/motor/plan','/motor/move','/motor/cancel'):
+                self._send(200,json.dumps(harness_bridge('motor-'+self.path.rsplit('/',1)[1],data)))
+            elif self.path == '/gripper-lock':
+                self._send(200,json.dumps(harness_bridge('gripper',data)))
+            elif self.path == '/instruction/update':
+                self._send(200,json.dumps(harness_bridge('instruction-update',data),ensure_ascii=False))
+            elif self.path == '/arm-lock':
+                self._send(200, json.dumps(harness_bridge('configure', data)))
+            elif self.path == "/flow/start":
                 FLOW.start(data)
                 self._send(200, json.dumps({"ok": True, "message": "流程已启动"}, ensure_ascii=False))
             elif self.path == "/flow/cancel":
@@ -1291,7 +1375,7 @@ class Handler(BaseHTTPRequestHandler):
                 instr = (data.get("instruction") or "").strip()
                 if not instr:
                     return self._send(200, json.dumps({"ok": False, "message": "指令为空"}))
-                self._send(200, json.dumps({"ok": True, "message": run_instruction(instr, data.get("mode") or "full", bool(data.get("use_agent")))},
+                self._send(200, json.dumps({"ok": True, "message": run_instruction(instr, data.get("mode") or "full", bool(data.get("use_agent")), bool(data.get("harness_hold")), data.get("harness_session_id"))},
                                            ensure_ascii=False))
             elif self.path == "/scan_rules":
                 save_rules({"default": data.get("default", ""),
@@ -1310,6 +1394,19 @@ class Handler(BaseHTTPRequestHandler):
 def find_perception_container():
     global PERCEPTION_CID
     try:
+        if SSH_USER:
+            import shlex
+            args = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]
+            if SSH_CONTROL_PATH:
+                args += ["-o", "ControlPath=" + SSH_CONTROL_PATH]
+            args += [SSH_USER + "@" + ROBOT_IP, shlex.join(["docker", "ps", "--format", "{{json .}}"])]
+            result = subprocess.run(args, capture_output=True, timeout=15, check=True)
+            containers = [json.loads(line) for line in result.stdout.decode().splitlines()]
+            for container in containers:
+                if "perception_ops" in container["Names"]:
+                    PERCEPTION_CID = container["ID"]
+                    return PERCEPTION_CID
+            return ""
         raw = _request(f"/endpoints/{ENDPOINT_ID}/docker/containers/json?all=1", timeout=15)
         for c in json.loads(raw):
             n = c["Names"][0].lstrip("/")
@@ -1371,13 +1468,14 @@ def ensure_wrist_daemon():
 
 
 def main():
-    global ROBOT_IP, _ep
+    global ROBOT_IP, ROBOT_API, _ep
     ap = argparse.ArgumentParser()
     ap.add_argument("--ip", default=ROBOT_IP)
     ap.add_argument("--port", type=int, default=8900)
     ap.add_argument("--host", default="127.0.0.1")
     a = ap.parse_args()
     ROBOT_IP = a.ip
+    ROBOT_API = f"http://{ROBOT_IP}:8898"
     _ep = f"http://{ROBOT_IP}:{PORTAINER_PORT}/api"
 
     print("=" * 60)
@@ -1390,7 +1488,7 @@ def main():
             print("  连接:", (shell_text("echo pong", timeout=12) or "").strip() or "无响应")
             print("  脚本:", ensure_scripts())
             print("  感知容器:", find_perception_container() or "未找到")
-            print("  腕部守护:", ensure_wrist_daemon(), "(2=两张图就绪)")
+            print("  状态守护:", ensure_wrist_daemon(), "(腕部图片文件数；实时性由预览接口检查)")
         except Exception as e:
             print("  自检失败:", e)
     threading.Thread(target=startup_checks, daemon=True).start()

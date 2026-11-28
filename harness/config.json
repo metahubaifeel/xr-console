@@ -1,0 +1,20 @@
+{
+  "monitor_interval": 5,
+  "max_vision_calls": 100,
+  "step_timeout": 180,
+  "max_step_retries": 2,
+  "joint_tolerance": 0.05,
+  "max_frame_age": 3,
+  "max_capture_span": 3,
+  "wrist_left": "wa",
+  "wrist_right": "wb",
+  "code_targets": {
+    "OUTA": "red",
+    "OUTB": "white",
+    "OUTC": "silver",
+    "ERR99": "black"
+  },
+  "auto_check": true,
+  "min_check_interval": 2.5,
+  "max_clock_skew": 1.0
+}

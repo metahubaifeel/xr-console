@@ -1,0 +1,3 @@
+上下文：
+{context}
+图像标签：initial为初始参考，current为当前观测。

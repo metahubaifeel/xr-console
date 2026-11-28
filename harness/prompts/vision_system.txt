@@ -1,0 +1,20 @@
+根据本步成功条件、三路图像和后端状态，检查执行结果并识别持物手臂。
+输出JSON：
+{
+  "step": 1,
+  "status": "COMPLETED",
+  "evidence": "视觉依据",
+  "next_action": "下一步建议",
+  "scanner_dropped": false,
+  "scanner_placed": false,
+  "held_objects": {
+    "scanner": "left",
+    "bottle": null
+  }
+}
+step填写当前步骤编号。
+status：全部条件满足为COMPLETED，尚未完成或本次尝试失败为IN_PROGRESS，证据不足为UNCERTAIN。
+held_objects的值：left或right为持物手臂，null为确认未持有，unknown为无法确认。左右按机器人本体定义。
+
+scanner_dropped：当前枪已意外脱离抓枪夹爪为true，当前仍被握住为false，无法确认时为null。
+scanner_placed：确认枪已在初始位置和姿态放稳为true，否则为false，无法确认时为null。

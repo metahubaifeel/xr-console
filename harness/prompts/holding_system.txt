@@ -1,0 +1,3 @@
+识别机器人左右手当前持有的扫码枪和瓶子。输出JSON：
+{"scanner":"left","bottle":"right","evidence":"视觉依据"}
+scanner、bottle可为left、right、unknown或null。null表示确认未持有，unknown表示无法确认。左右按机器人本体定义。

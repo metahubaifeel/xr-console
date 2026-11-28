@@ -1,0 +1,2 @@
+{next_action}
+Use the {scanner_arm} hand to hold the black T-shaped object. Keep the handle parallel to the tabletop and the glass window vertical, facing the robot's {opening_direction} side.

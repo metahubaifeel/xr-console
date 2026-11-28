@@ -1,0 +1,4 @@
+{
+  "execution_prompt": "Place the bottle upright inside the {target} rectangular frame. Release it once it is stable.",
+  "verification_prompt": "瓶子直立稳定地放在{target}色定位框内，夹爪已松开并离开瓶子。"
+}
