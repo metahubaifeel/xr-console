@@ -10,8 +10,8 @@
   "wrist_right": "wb",
   "code_targets": {
     "OUTA": "red",
-    "OUTB": "white",
-    "OUTC": "silver",
+    "OUTB": "silver",
+    "OUTC": "white",
     "ERR99": "black"
   },
   "auto_check": true,

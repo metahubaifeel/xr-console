@@ -55,10 +55,11 @@ class ConsoleRobot:
         return http_json((self.c['control_url'] or self.c['console_url']) + '/capabilities')
 
     def camera(self, name):
-        dev = {'head': '8', 'left': self.c['wrist_left'], 'right': self.c['wrist_right'], 'bev1': '0', 'bev2': '6'}.get(name)
+        dev = {'head': '8', 'left': 'wa', 'right': 'wb', 'bev1': '0', 'bev2': '6'}.get(name)
         if dev is None:
             raise ValueError('unknown camera')
-        raw = http(self.c['console_url'] + '/snap?d=' + dev, timeout=5)
+        cam_url = self.c.get('cam_url') or self.c['console_url']
+        raw = http(cam_url + '/snap?d=' + dev, timeout=5)
         if not raw.startswith(b'\xff\xd8') or not raw.endswith(b'\xff\xd9'):
             raise RuntimeError('camera has no complete JPEG')
         return raw
@@ -175,14 +176,18 @@ class OpenAIVision:
             'scanner_dropped': {'type':['boolean','null']},
             'scanner_placed': {'type':['boolean','null']},
             'held_objects': {'type': 'object', 'properties': {
-                'scanner': {'type': ['string', 'null'], 'enum': ['left', 'right', 'unknown', None]},
-                'bottle': {'type': ['string', 'null'], 'enum': ['left', 'right', 'unknown', None]}},
+                'scanner': {'type': ['string', 'null'], 'enum': ['left', 'right', 'unknown']},
+                'bottle': {'type': ['string', 'null'], 'enum': ['left', 'right', 'unknown']}},
                 'required': ['scanner', 'bottle'], 'additionalProperties': False}},
             'required': ['step', 'status', 'evidence', 'next_action', 'held_objects', 'scanner_dropped', 'scanner_placed'], 'additionalProperties': False}
-        return {'model': self.c['model'], 'instructions': prompt('vision_system.txt'),
-                'input': [{'role': 'user', 'content': content}], 'store': False,
-                'reasoning': {'effort': 'none'}, 'max_output_tokens': 600,
-                'text': {'format': {'type': 'json_schema', 'name': 'execution_judgment', 'strict': True, 'schema': schema}}}
+        p={'model': self.c['model'], 'instructions': prompt('vision_system.txt'),
+           'input': [{'role': 'user', 'content': content}], 'store': False,
+           'max_output_tokens': 800,
+           'text': {'format': {'type': 'json_schema', 'name': 'execution_judgment', 'strict': True, 'schema': schema}}}
+        _m=(self.c['model'] or '').lower()
+        if _m.startswith('o') or 'gpt-5' in _m or 'gpt-6' in _m:
+            p['reasoning']={'effort':'none'}
+        return p
 
     def _request(self, payload):
         if not self.c['openai_key']:
@@ -191,7 +196,7 @@ class OpenAIVision:
         self.last_raw_text = None
         self.last_metadata = None
         result = http_json('https://api.openai.com/v1/responses', payload,
-                           timeout=40, headers={'Authorization': 'Bearer ' + self.c['openai_key']})
+                           timeout=120, headers={'Authorization': 'Bearer ' + self.c['openai_key']})
         self.last_raw_text = ''.join(c.get('text', '') for o in result.get('output', [])
                                     for c in o.get('content', []) if c.get('type') == 'output_text')
         self.last_metadata = {'response_id': result.get('id'), 'model': result.get('model'), 'usage': result.get('usage')}
@@ -209,13 +214,17 @@ class OpenAIVision:
         for name in ['head', 'left', 'right']:
             content += [{'type': 'input_text', 'text': 'camera=' + name},
                         {'type': 'input_image', 'image_url': observation['frames'][name]['url']}]
-        hand = {'type': ['string', 'null'], 'enum': ['left', 'right', 'unknown', None]}
+        hand = {'type': ['string', 'null'], 'enum': ['left', 'right', 'unknown']}
         schema = {'type': 'object', 'properties': {'scanner': hand, 'bottle': hand, 'evidence': {'type': 'string'}},
                   'required': ['scanner', 'bottle', 'evidence'], 'additionalProperties': False}
-        result = self._request({'model': self.c['model'], 'instructions': prompt('holding_system.txt'),
-                     'input': [{'role': 'user', 'content': content}], 'store': False,
-                     'reasoning': {'effort': 'none'}, 'max_output_tokens': 400,
-                     'text': {'format': {'type': 'json_schema', 'name': 'holding_hands', 'strict': True, 'schema': schema}}})
+        _p = {'model': self.c['model'], 'instructions': prompt('holding_system.txt'),
+              'input': [{'role': 'user', 'content': content}], 'store': False,
+              'max_output_tokens': 500,
+              'text': {'format': {'type': 'json_schema', 'name': 'holding_hands', 'strict': True, 'schema': schema}}}
+        _m = (self.c['model'] or '').lower()
+        if _m.startswith('o') or 'gpt-5' in _m or 'gpt-6' in _m:
+            _p['reasoning'] = {'effort': 'none'}
+        result = self._request(_p)
         if (not isinstance(result, dict) or any(result.get(k) not in ('left', 'right', 'unknown', None) for k in ['scanner','bottle'])
                 or not isinstance(result.get('evidence'), str)):
             raise ValueError('invalid holding recognition')

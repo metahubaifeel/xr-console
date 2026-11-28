@@ -18,6 +18,7 @@ def settings():
     config['openai_key'] = env.get('OPENAI_API_KEY', '')
     config['console_url'] = env.get('XR_CONSOLE_URL', 'http://127.0.0.1:8900').rstrip('/')
     config['control_url'] = env.get('XR_CONTROL_URL', '').rstrip('/')
+    config['cam_url'] = env.get('XR_CAM_URL', '').rstrip('/')
     return config
 
 def prompt(name, **values):

@@ -120,8 +120,13 @@ def _exec(cmd_list, detach=False, timeout=30, retries=2, cid=None):
     if SSH_USER:
         import shlex
         remote = ["docker", "exec"] + (["-d"] if detach else []) + [cid or CONTAINER_ID] + cmd_list
-        args = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]
-        if SSH_CONTROL_PATH:
+        _pw = os.environ.get('SSH_PASSWORD', '123')
+        args = ["sshpass", "-p", _pw, "ssh", "-o", "BatchMode=no",
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "PreferredAuthentications=password",
+                "-o", "PubkeyAuthentication=no",
+                "-o", "ConnectTimeout=8"]
+        if SSH_CONTROL_PATH and os.path.exists(SSH_CONTROL_PATH):
             args += ["-o", "ControlPath=" + SSH_CONTROL_PATH]
         args += [SSH_USER + "@" + ROBOT_IP, shlex.join(remote)]
         try:
@@ -210,7 +215,9 @@ def cam_worker():
         time.sleep(0.8)
 
 
+CAM_PORT = os.environ.get("ROBOT_CAM_PORT", "8895")
 ROBOT_API = f"http://{ROBOT_IP}:8898"
+CAM_API = f"http://{ROBOT_IP}:{CAM_PORT}"
 
 
 def robot_get(path, timeout=8):
@@ -340,6 +347,31 @@ def run_instruction(instr, mode="full", use_agent=False, harness_hold=False, har
     return f"[{tag}] {instr}"
 
 
+def _loose_json(raw, tag='bridge'):
+    """从可能混有日志行的输出里取出最后一个 JSON 对象"""
+    text = raw.decode('utf-8', 'replace') if isinstance(raw, (bytes, bytearray)) else str(raw)
+    lines = [l.strip() for l in text.strip().splitlines()]
+    cands = [l for l in lines if l.startswith('{') and l.endswith('}')]
+    if not cands:
+        raise RuntimeError(f'{tag} 没有返回 JSON：' + (' | '.join(lines[-3:]) or '空输出')[:300])
+    return json.loads(cands[-1])
+
+
+
+def _cam_get(dev):
+    """从机器人端 cam_srv(:8895) 取图；失败返回 None"""
+    global CAM_API
+    for base in (CAM_API,):
+        try:
+            with _robot_http.open(base + "/snap?d=" + str(dev), timeout=6) as r:
+                d = r.read()
+            if d[:2] == b'\xff\xd8' and d[-2:] == b'\xff\xd9':
+                return d
+        except Exception:
+            pass
+    return None
+
+
 def harness_bridge(operation, payload=None):
     if operation.startswith('motor-'):
         import shlex
@@ -347,8 +379,11 @@ def harness_bridge(operation, payload=None):
         if op not in ('catalog','plan','move','cancel','status'):raise ValueError('unknown motor operation')
         command=('source /opt/xr/bot/x2robot_client/share/x2robot_client/scripts/session_env.sh >/dev/null 2>&1; '
                  'exec python3 /tmp/xr-harness/motor_control.py '+op+' '+shlex.quote(json.dumps(payload or {},ensure_ascii=False)))
-        raw=_exec(['bash','-lc',command],timeout=85 if op=='move' else 12,retries=1)
-        result=json.loads(raw.decode('utf-8').strip().splitlines()[-1])
+        raw=_exec(['bash','-lc',command],timeout=95 if op=='move' else 20,retries=1)
+        _lines=[_l.strip() for _l in raw.decode('utf-8', 'replace').strip().splitlines()]
+        _js=[_l for _l in _lines if _l.startswith('{') and _l.endswith('}')]
+        if not _js:raise RuntimeError('motor_control 没有返回 JSON：'+(' | '.join(_lines[-3:]) or '空输出')[:300])
+        result=json.loads(_js[-1])
         if 'error' in result:
             kind=ValueError if result['error']=='ValueError' else RuntimeError
             raise kind(result.get('message',result['error']))
@@ -357,16 +392,16 @@ def harness_bridge(operation, payload=None):
         import shlex
         command=('source /opt/xr/bot/x2robot_client/share/x2robot_client/scripts/session_env.sh >/dev/null 2>&1; '
                  'exec python3 /tmp/xr-harness/update_instruction.py '+shlex.quote(json.dumps(payload,ensure_ascii=False)))
-        raw=_exec(['bash','-lc',command],timeout=10,retries=1)
-        result=json.loads(raw.decode('utf-8'))
+        raw=_exec(['bash','-lc',command],timeout=15,retries=1)
+        result=_loose_json(raw, 'instruction update')
         if 'error' in result:
             raise RuntimeError('instruction update: '+result.get('message',result['error']))
         return result
     args = ['python3', '/tmp/xr-harness/bridge.py', operation]
     if payload is not None:
         args.append(json.dumps(payload, ensure_ascii=False))
-    raw = _exec(args, timeout=10, retries=1)
-    result = json.loads(raw.decode('utf-8'))
+    raw = _exec(args, timeout=15, retries=1)
+    result = _loose_json(raw, 'hold bridge')
     if 'error' in result:
         raise RuntimeError('hold bridge: ' + result.get('message', result['error']))
     return result
@@ -1277,7 +1312,7 @@ class Handler(BaseHTTPRequestHandler):
             dev = value if value in WRIST else int(value) if value.isdecimal() else None
             if dev not in CAMS:
                 return self._send(400, '{"error":"unknown camera"}')
-            data = _wrist_raw(dev) if dev in WRIST else (robot_get(f"/snap?d={dev}") or snapshot(dev))
+            data = _cam_get(dev) or (_wrist_raw(dev) if dev in WRIST else (robot_get(f"/snap?d={dev}") or snapshot(dev)))
             if not data:
                 self._send(404, b"", "image/jpeg")
             else:
@@ -1296,6 +1331,21 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 self._send(503, '{"arm_lock":false,"error":"hold bridge unavailable"}')
         elif self.path == "/video-health":
+            import time as _t
+            _out={"ok":True,"cams":{},"capture":{},"joints":True}
+            try:
+                with _robot_http.open(CAM_API+"/health",timeout=6) as _r:
+                    _h=json.load(_r)
+                for _n,_sz in (_h.get("cams") or {}).items():
+                    _age=float((_h.get("age") or {}).get(_n,99))
+                    _dev={"head":"8","chest":"wa","bev":"0"}.get(_n,_n)
+                    _out["capture"][_dev]={"bytes":_sz,"age":round(_age,2),
+                                           "ts":_t.time()-_age,"fps":1.0 if _age<2 else 0.0}
+                    _out["cams"][_dev]=_out["capture"][_dev]
+                _out["ok"]=all(v["age"]<3 for v in _out["capture"].values()) and bool(_out["capture"])
+            except Exception as _e:
+                _out["error"]=str(_e)[:200]
+            self._send(200, json.dumps(_out))
             self._send(200, robot_get('/health', timeout=2) or '{}')
         elif self.path == "/flow":
             self._send(200, json.dumps(FLOW.state(), ensure_ascii=False))
@@ -1476,6 +1526,8 @@ def main():
     a = ap.parse_args()
     ROBOT_IP = a.ip
     ROBOT_API = f"http://{ROBOT_IP}:8898"
+    global CAM_API
+    CAM_API = f"http://{ROBOT_IP}:{CAM_PORT}"
     _ep = f"http://{ROBOT_IP}:{PORTAINER_PORT}/api"
 
     print("=" * 60)

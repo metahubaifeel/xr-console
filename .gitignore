@@ -4,3 +4,10 @@ __pycache__/
 *.pyc
 .DS_Store
 dist/
+harness.env
+
+.harness_state/
+*.env
+gpt.env
+harness.env
+__pycache__/
