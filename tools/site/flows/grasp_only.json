@@ -1,0 +1,2 @@
+{"name":"只抓扫码枪（抓到后停住不归零）","robot_ip":"10.230.20.13",
+ "steps":[{"id":"grasp","say":"grasp the black handle of the scanner","sec":80}]}

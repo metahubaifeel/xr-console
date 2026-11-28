@@ -1,0 +1,13 @@
+{
+  "name": "单手持枪扫码（抓枪 → 凑到瓶前 → 扫 OUTB → 放银框）",
+  "robot_ip": "10.230.20.13",
+  "steps": [
+    {"id": "grasp",     "say": "grasp the handle of the scanner from the side", "sec": 60},
+    {"id": "settle",    "say": "hold the scanner still",                      "sec": 6},
+    {"id": "aim",       "say": "move the scanner to the bottle",              "sec": 45},
+    {"id": "wait_scan", "wait_scan": 60},
+    {"id": "place",     "say_from_scan": true,                                "sec": 70},
+    {"id": "rest",      "say": "put both arms back to a rest position",       "sec": 15},
+    {"id": "home",      "home": true}
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "default": "put the bottle into the red square",
+  "map": {
+    "OUTA": "put the bottle into the red square",
+    "OUTB": "put the bottle into the silver square",
+    "OUTC": "put the bottle into the white square",
+    "ERR99": "put the bottle into the black square",
+    "ERR": "put the bottle into the black square",
+    "OUTD": "put the bottle into the black square"
+  }
+}

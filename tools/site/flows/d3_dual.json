@@ -1,0 +1,15 @@
+{
+  "name": "D3 双持扫码（右手枪 / 左手瓶 / 扫 OUTB / 放银框）",
+  "robot_ip": "10.230.20.13",
+  "steps": [
+    {"id": "grasp_gun",   "say": "grasp the handle of the scanner from the side",   "sec": 60},
+    {"id": "hold_gun",    "say": "hold the scanner still",                        "sec": 6},
+    {"id": "grasp_obj",   "say": "grasp the bottle with the other hand",           "sec": 60},
+    {"id": "hold_both",   "say": "hold both objects still",                       "sec": 6},
+    {"id": "aim",         "say": "point the scanner at the bottle",               "sec": 45},
+    {"id": "wait_scan",   "wait_scan": 60},
+    {"id": "place",       "say_from_scan": true,                                  "sec": 70},
+    {"id": "rest",        "say": "put both arms back to a rest position",         "sec": 15},
+    {"id": "home",        "home": true}
+  ]
+}
