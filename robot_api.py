@@ -163,6 +163,13 @@ class H(BaseHTTPRequestHandler):
                 self._send(200, d, "image/jpeg")
             else:
                 self._send(404, b"", "image/jpeg")
+        elif self.path.startswith("/wrist"):
+            k = "b" if "k=b" in self.path else "a"
+            d = read_bytes(f"/tmp/wrist_{k}.jpg")
+            if d[:2] == b"\xff\xd8":
+                self._send(200, d, "image/jpeg")
+            else:
+                self._send(404, b"", "image/jpeg")
         elif self.path == "/joints":
             self._send(200, read_bytes("/tmp/joints.json") or b"{}")
         elif self.path == "/gripper":

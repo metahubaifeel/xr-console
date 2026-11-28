@@ -44,6 +44,105 @@ ARMS = ("left_ee", "right_ee")
 
 _stats = {"req": 0, "frozen": 0, "err": 0, "last_t": 0.0}
 
+# ===== 中途改 prompt =====
+_current = {"instruction": None, "since": 0.0, "base": None}
+
+# ===== 姿态钉死：把某条臂的 rotation_rpy 强制成固定值 =====
+_pin = {"left_ee": None, "right_ee": None}
+
+
+import math
+
+
+def _rpy2R(r, p, y):
+    cr, sr = math.cos(r), math.sin(r)
+    cp, sp = math.cos(p), math.sin(p)
+    cy, sy = math.cos(y), math.sin(y)
+    return [[cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+            [-sp,     cp * sr,                cp * cr]]
+
+
+def _R2rpy(R):
+    p = math.asin(max(-1.0, min(1.0, -R[2][0])))
+    if abs(math.cos(p)) < 1e-6:
+        r = 0.0
+        y = math.atan2(-R[0][1], R[1][1])
+    else:
+        r = math.atan2(R[2][1], R[2][2])
+        y = math.atan2(R[1][0], R[0][0])
+    return [r, p, y]
+
+
+def _spin_tool(rpy, theta):
+    """绕工具坐标系 Z 轴自转 theta（等效转第 6 关节）"""
+    R = _rpy2R(*rpy)
+    c, s2 = math.cos(theta), math.sin(theta)
+    Rz = [[c, -s2, 0.0], [s2, c, 0.0], [0.0, 0.0, 1.0]]
+    M = [[sum(R[i][k] * Rz[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+    return _R2rpy(M)
+
+
+_pin["spin"] = {"left_ee": 0.0, "right_ee": 0.0}
+
+
+def set_spin(arm, deg):
+    """给某条臂加一个工具轴自转偏移（度）。+90 = 逆时针（俯视看）"""
+    if arm not in _pin["spin"]:
+        return None
+    _pin["spin"][arm] = math.radians(float(deg))
+    print(f"[spin] {arm} 工具轴自转 {deg:+.1f}°", flush=True)
+    return deg
+
+
+def set_pin(arm, rpy):
+    """rpy = [roll,pitch,yaw] 弧度；None 取消"""
+    if arm not in _pin:
+        return None
+    _pin[arm] = None if rpy is None else [float(x) for x in rpy]
+    print(f"[pin] {arm} 姿态钉死 → {_pin[arm]}", flush=True)
+    return _pin[arm]
+
+
+def apply_pin(reply, verbose=False):
+    acts = reply.get("actions")
+    if not isinstance(acts, dict):
+        return reply
+    # ① 工具轴自转（等效转第 6 关节）
+    for arm in ("left_ee", "right_ee"):
+        th = _pin["spin"].get(arm) or 0.0
+        if abs(th) < 1e-6:
+            continue
+        blk = acts.get(arm)
+        if not isinstance(blk, dict):
+            continue
+        try:
+            blk["rotation_rpy"] = [_spin_tool(list(r), th)
+                                   for r in blk.get("rotation_rpy", [])]
+            if verbose:
+                print(f"[spin] {arm} 自转 {math.degrees(th):+.1f}° 已应用", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[spin] 失败 {e}", flush=True)
+    for arm, rpy in _pin.items():
+        if arm == "spin":
+            continue
+        if rpy is None:
+            continue
+        blk = acts.get(arm)
+        if not isinstance(blk, dict):
+            continue
+        blk["rotation_rpy"] = [list(rpy) for _ in range(32)]
+        if verbose:
+            print(f"[pin] {arm} rotation_rpy → {[round(v,3) for v in rpy]} ×32", flush=True)
+    return reply
+
+
+def set_instruction(text):
+    """设置当前生效的 instruction（None = 用 client 自己发的）"""
+    _current["instruction"] = (text or "").strip() or None
+    _current["since"] = time.time()
+    return _current["instruction"]
+
 
 # ---------------- msgpack ----------------
 def unpack(frame):
@@ -110,6 +209,11 @@ def freeze_arm(reply, request, arm, verbose=False):
 # ---------------- 转发 ----------------
 def process_observation(request):
     payload = copy.deepcopy(request)
+    if _current["base"] is None:
+        _current["base"] = payload.get("instruction")
+    # 中途改 prompt：用当前设定覆盖 client 那一句静态指令
+    if _current["instruction"]:
+        payload["instruction"] = _current["instruction"]
     if any(k in payload for k in ("use_rtc", "prev_action_chunk", "inference_delay")):
         raise ValueError("本中间层只支持 sync（不支持 RTC）")
     ins = payload.get("instruction")
@@ -141,6 +245,7 @@ def handle_client(client_ws, lock_arm="right_ee", verbose=False):
 
                 if "error" not in reply:
                     reply = freeze_arm(reply, req, lock_arm, verbose)
+                    reply = apply_pin(reply, verbose)
 
                 client_ws.send(pack(reply))
     except ConnectionClosed:
@@ -153,12 +258,81 @@ def handle_client(client_ws, lock_arm="right_ee", verbose=False):
             pass
 
 
+def start_control_server(port, verbose=False):
+    """HTTP 控制口：POST /say {"instruction": "..."} 中途改 prompt"""
+    import json as _json
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code, obj):
+            b = _json.dumps(obj, ensure_ascii=False).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(b)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            try:
+                self.wfile.write(b)
+            except Exception:  # noqa: BLE001
+                pass
+
+        def do_GET(self):
+            self._send(200, {"now": _current["instruction"],
+                             "pin": {k: v for k, v in _pin.items() if k != "spin"},
+                             "spin_deg": {k: round(math.degrees(v), 1)
+                                          for k, v in _pin["spin"].items()},
+                             "client_said": _current["base"],
+                             "since": _current["since"],
+                             "stats": _stats})
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                data = _json.loads(self.rfile.read(n) or b"{}")
+            except Exception:  # noqa: BLE001
+                data = {}
+            if self.path == "/say":
+                v = set_instruction(data.get("instruction"))
+                if verbose:
+                    print(f"[prompt] 中途改为: {v!r}", flush=True)
+                self._send(200, {"ok": True, "now": v})
+            elif self.path == "/spin":
+                arm = data.get("arm", "left_ee")
+                arm = {"left": "left_ee", "l": "left_ee",
+                       "right": "right_ee", "r": "right_ee"}.get(arm, arm)
+                v = set_spin(arm, data.get("deg", 0))
+                self._send(200, {"ok": True, "arm": arm, "deg": v})
+            elif self.path == "/pin":
+                arm = data.get("arm", "left_ee")
+                if arm in ("left", "l"):
+                    arm = "left_ee"
+                if arm in ("right", "r"):
+                    arm = "right_ee"
+                v = set_pin(arm, data.get("rpy"))
+                self._send(200, {"ok": True, "arm": arm, "rpy": v})
+            elif self.path == "/clear":
+                set_instruction(None)
+                self._send(200, {"ok": True, "now": None})
+            else:
+                self._send(404, {})
+
+    srv = ThreadingHTTPServer(("0.0.0.0", port), H)
+    import threading as _th
+    _th.Thread(target=srv.serve_forever, daemon=True).start()
+    print(f"  控制口    http://0.0.0.0:{port}  （POST /say 中途改 prompt）", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--lock", default="right", choices=["left", "right", "none"],
                     help="锁哪条臂（默认 right）")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8001)
+    ap.add_argument("--say-port", type=int, default=8002, help="中途改 prompt 的控制口")
+    ap.add_argument("--no-say", action="store_true", help="不启动控制口")
     ap.add_argument("--verbose", action="store_true")
     a = ap.parse_args()
 
@@ -181,6 +355,8 @@ def main():
     print(f"  上游      {API_URL}")
     print(f"  client 请把 --model-address 指到  ws://<本机IP>:{a.port}")
     print("=" * 58)
+    if not a.no_say:
+        start_control_server(a.say_port, a.verbose)
 
     def handler(ws):
         handle_client(ws, lock, a.verbose)

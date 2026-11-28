@@ -4,7 +4,7 @@ import time
 
 
 class ScanFlow:
-    def __init__(self, run, stop, scan, rules, *, harness_ready=None, place=None):
+    def __init__(self, run, stop, scan, rules, *, harness_ready=None, place=None, grasp_check=None):
         """run: right-locked harness; stop: stop-only, never home.
 
         harness_ready must verify the client route AND active lock mode.
@@ -13,6 +13,7 @@ class ScanFlow:
         """
         self.run, self.stop, self.scan, self.rules = run, stop, scan, rules
         self.harness_ready, self.place = harness_ready, place
+        self.grasp_check = grasp_check
         self.lock = threading.RLock()
         self.cancel = threading.Event()
         self.worker = None
@@ -48,7 +49,7 @@ class ScanFlow:
             if not all(1 <= v <= 120 for v in durations):
                 raise ValueError("各阶段时限必须为 1–120 秒")
             self.cancel.clear()
-            self.data = {"stage": "starting", "dry_run": dry, "code": None, "events": []}
+            self.data = {"stage": "starting", "dry_run": dry, "scan_only": bool(options.get("scan_only", False)), "code": None, "events": []}
             self.worker = threading.Thread(target=self._work, args=(dry, durations, rules), daemon=True)
             self.worker.start()
 
@@ -69,8 +70,6 @@ class ScanFlow:
         # not a claim about the model's universal maximum instruction length.
         if not isinstance(instruction, str) or not instruction.strip():
             raise ValueError("动作指令不能为空")
-        if "barcode" in instruction.casefold() or len(instruction.split()) > 16:
-            raise ValueError("动作指令须不超过16词，且不能包含 barcode")
 
     def _wait(self, seconds):
         if self.cancel.wait(seconds):
@@ -79,8 +78,11 @@ class ScanFlow:
     def _work(self, dry, durations, rules):
         try:
             self.event("grasp", "抓枪：按时限切步，尚无视觉完成判定")
-            self._command(dry, "grasp the black handle of the scanner")
+            self._command(dry, "grasp the black handle with the fingers aligned along it")
             self._wait(0.05 if dry else durations[0])
+            if not dry and (self.grasp_check is None or self.grasp_check() is not True):
+                self.event("grasp_unverified", "尚未确认扫码枪已抓稳；停止本轮，不下发对准或转腕")
+                return
             # Establish baseline before issuing alignment: fast scans must not be lost.
             baseline = time.time()
             self.event("scan", "对准并等待本轮新码")
@@ -97,6 +99,9 @@ class ScanFlow:
                     raise TimeoutError("没有收到本轮已配置的条码，流程终止")
             with self.lock:
                 self.data["code"] = code
+            if self.data.get("scan_only"):
+                self.event("scan_received", "模拟读码完成" if dry else "收到本轮新码；两步测试结束，只停止推理")
+                return
             if not dry and self.place is None:
                 self.event("awaiting_handoff", "收到 " + code + "；等待放回枪及切换锁臂，不自动搬瓶")
                 return

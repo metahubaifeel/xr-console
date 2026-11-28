@@ -1,0 +1,13 @@
+{
+  "name": "扫码分拣（抓枪 → 对准 → 扫码 → 按码放置）",
+  "robot_ip": "10.230.20.13",
+  "steps": [
+    {"id": "grasp",     "say": "grasp the handle of the scanner from the side", "sec": 75},
+    {"id": "settle",    "say": "hold the scanner still",                      "sec": 8},
+    {"id": "aim",       "say": "point the scanner at the bottle",             "sec": 45},
+    {"id": "wait_scan", "wait_scan": 60},
+    {"id": "place",     "say_from_scan": true,                                "sec": 70},
+    {"id": "rest",      "say": "put both arms back to a rest position",       "sec": 15},
+    {"id": "home",      "home": true}
+  ]
+}

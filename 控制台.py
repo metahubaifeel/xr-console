@@ -12,12 +12,11 @@
   · 停止回零、实时日志
 
 原理
-  走官方 Portainer API (admin/xsquarerobot) 在 client 容器里 exec，
+  通过用户配置的 Portainer API 在 client 容器里 exec，
   不需要 SSH。相机用 v4l2 直采 MJPG（免转码）。
 
 用法
-  python3 控制台.py                 # 默认 10.230.20.13:8900
-  python3 控制台.py --ip 10.230.20.13 --port 8900
+  python3 控制台.py --ip <机器人IP> --host 127.0.0.1 --port 8900
 """
 
 import argparse
@@ -32,26 +31,31 @@ import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from scan_flow import ScanFlow
+import native_teach
 
 # Robot services are on the local network; never route them through a web proxy.
 _robot_http = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 # ---------------- 配置 ----------------
-ROBOT_IP = "10.230.20.13"
+ROBOT_IP = os.environ.get("ROBOT_IP", "127.0.0.1")
 PORTAINER_PORT = 9000
-ENDPOINT_ID = 3
-CONTAINER_ID = "05c14da94c70"       # ex001_client-robot_client-1
+SSH_USER = "xr"
+SSH_PASS = os.environ.get("XR_SSH_PASS", "123")
+ENDPOINT_ID = int(os.environ.get("PORTAINER_ENDPOINT_ID", "3"))
+CONTAINER_ID = os.environ.get("ROBOT_CLIENT_CONTAINER", "ex001_client-robot_client-1")
 PERCEPTION_CID = ""                # ex001_client-robot_perception_ops-1（启动时自动查）
-PORTAINER_USER = "admin"
-PORTAINER_PASS = "xsquarerobot"
+PORTAINER_USER = os.environ.get("PORTAINER_USER", "admin")
+PORTAINER_PASS = os.environ.get("PORTAINER_PASS", "")
 LOG_PATH = "/tmp/l0.log"
-HELPER = "/tmp/d3.sh"
+HELPER = "/tmp/d3h.sh"   # 走锁臂中间层（右臂锁死）
 STOP_SH = "/tmp/stop.sh"
 
 # 相机：device -> 标签（实测可用的排前面）
-CAMS = {8: "头部前方 RGBD（看得到两只夹爪）",
-        0: "BEV-1 机身旁（看全局避障）",
-        6: "BEV-2 机身旁（看全局避障）"}
+CAMS = {0: "鱼眼 1（左）",
+        8: "头部主视角 ★",
+        6: "鱼眼 2（右）",
+        "wa": "左腕",
+        "wb": "右腕"}
 # 腕部相机 video2/4 被感知栈独占，取不到；video0 时好时坏，暂不展示
 CAM_RES = {8: [(1280, 960), (1280, 720), (640, 480)],
            0: [(1600, 1200), (1280, 720)],
@@ -114,32 +118,33 @@ def _demux(raw):
 
 
 def _exec(cmd_list, detach=False, timeout=30, retries=2, cid=None):
-    body = json.dumps({"Cmd": cmd_list, "AttachStdout": True,
-                       "AttachStderr": True, "Tty": False}).encode()
-    for attempt in range(1, retries + 1):
-        try:
-            token(force=(attempt > 1))
-            req = urllib.request.Request(
-                f"{_ep}/endpoints/{ENDPOINT_ID}/docker/containers/{cid or CONTAINER_ID}/exec",
-                data=body, method="POST")
-            req.add_header("Content-Type", "application/json")
-            req.add_header("Authorization", "Bearer " + _jwt["token"])
-            with _robot_http.open(req, timeout=15) as r:
-                eid = json.loads(r.read())["Id"]
+    """通过 SSH + docker exec 在容器里执行（Portainer 登录被拒后的替代通道）"""
+    import shlex
+    import subprocess as _sp
 
-            req2 = urllib.request.Request(
-                f"{_ep}/endpoints/{ENDPOINT_ID}/docker/exec/{eid}/start",
-                data=json.dumps({"Detach": detach, "Tty": False}).encode(), method="POST")
-            req2.add_header("Content-Type", "application/json")
-            req2.add_header("Authorization", "Bearer " + _jwt["token"])
-            with _robot_http.open(req2, timeout=timeout) as r:
-                raw = r.read()
-            if detach:
-                return b""
-            return _demux(raw)
+    script = cmd_list[2] if (len(cmd_list) == 3 and cmd_list[0] == "bash") else " ".join(cmd_list)
+    b64 = base64.b64encode(script.encode()).decode()
+    container = cid or CONTAINER_ID
+    dflag = "-d " if detach else ""
+    # 远端命令：docker exec [-d] <cid> bash -lc 'echo <b64> | base64 -d | bash'
+    remote = f"docker exec {dflag}{container} bash -lc 'echo {b64} | base64 -d | bash'"
+    cmd = ["sshpass", "-p", SSH_PASS, "ssh",
+           "-o", "StrictHostKeyChecking=no",
+           "-o", "PreferredAuthentications=password",
+           "-o", "PubkeyAuthentication=no",
+           "-o", f"ConnectTimeout={min(8, int(timeout))}",
+           "-o", "LogLevel=ERROR",
+           f"{SSH_USER}@{ROBOT_IP}", remote]
+    for attempt in range(1, (retries or 1) + 1):
+        try:
+            r = _sp.run(cmd, capture_output=True, timeout=timeout)
+            if r.returncode == 0 or detach:
+                return b"" if detach else r.stdout
+            if attempt >= (retries or 1):
+                return (r.stdout + r.stderr)[:2000]
         except Exception as e:  # noqa: BLE001
-            if attempt >= retries:
-                return f"[控制台错误] {type(e).__name__}: {e}".encode()
+            if attempt >= (retries or 1):
+                return f"[ssh 错误] {type(e).__name__}: {e}".encode()
     return b""
 
 
@@ -198,13 +203,17 @@ def cam_worker():
         time.sleep(0.8)
 
 
-ROBOT_API = f"http://{ROBOT_IP}:8898"
+def _robot_api():
+    return f"http://{ROBOT_IP}:8898"
+
+
+ROBOT_API = ""  # 兼容占位，实际用 _robot_api()
 
 
 def robot_get(path, timeout=8):
     """直连机器人上的数据服务（比 Portainer exec 快 10 倍）"""
     try:
-        with _robot_http.open(ROBOT_API + path, timeout=timeout) as r:
+        with _robot_http.open(_robot_api() + path, timeout=timeout) as r:
             return r.read()
     except Exception:  # noqa: BLE001
         return None
@@ -316,8 +325,34 @@ def run_instruction(instr, mode="full", use_agent=False):
 
 
 def stop_all():
-    return shell_text(f"bash {STOP_SH} 2>&1", timeout=120, retries=1).strip() or "已停止"
+    """只停会话，不动手臂（内联执行，不依赖容器脚本文件）"""
+    inline = (
+        "PAT='start_ex001[.]py'; "
+        'if pgrep -f "$PAT" >/dev/null; then '
+        'kill $(pgrep -f "$PAT") 2>/dev/null; '
+        'for i in $(seq 1 12); do pgrep -f "$PAT" >/dev/null || break; sleep 1; done; '
+        'pkill -9 -f "$PAT" 2>/dev/null; '
+        'echo "会话已停止（手臂保持原位，夹爪保持开合）"; '
+        "else echo '没有正在跑的会话'; fi; rm -f /tmp/xr.pid"
+    )
+    return shell_text(inline, timeout=55, retries=1).strip() or "已停止"
 
+
+def home_all():
+    """停止 + 正规归零（内联执行）"""
+    inline = (
+        "PAT='start_ex001[.]py'; "
+        'if pgrep -f "$PAT" >/dev/null; then '
+        'kill $(pgrep -f "$PAT") 2>/dev/null; '
+        'for i in $(seq 1 12); do pgrep -f "$PAT" >/dev/null || break; sleep 1; done; '
+        'pkill -9 -f "$PAT" 2>/dev/null; fi; rm -f /tmp/xr.pid; sleep 1; '
+        "source /opt/xr/bot/x2robot_client/share/x2robot_client/scripts/session_env.sh >/dev/null 2>&1; "
+        'OUT=$(python3 -m x2robot_client.zero_arm --timeout 90 2>&1); '
+        'if echo "$OUT" | grep -q "homing complete"; then '
+        'echo "已归零（夹爪里的东西会跟着回零位）"; else '
+        'echo "归零未确认:"; echo "$OUT" | tail -3; fi'
+    )
+    return shell_text(inline, timeout=120, retries=1).strip() or "已归零"
 
 def read_log(n=60):
     return shell_text(f"tail -{n} {LOG_PATH} 2>/dev/null || echo '(还没有日志)'")
@@ -382,22 +417,7 @@ echo $! > "$PIDF"
 '''
 
 _STOP_SH = r'''#!/bin/bash
-# 只停会话，不动手臂（方便人先取下手里的东西）
-PAT='start_ex001[.]py'
-if pgrep -f "$PAT" >/dev/null; then
-  kill $(pgrep -f "$PAT") 2>/dev/null
-  for i in $(seq 1 12); do pgrep -f "$PAT" >/dev/null || break; sleep 1; done
-  pkill -9 -f "$PAT" 2>/dev/null
-  echo "会话已停止（手臂保持原位，夹爪保持开合）"
-else
-  echo "没有正在跑的会话"
-fi
-rm -f /tmp/xr.pid
-'''
-
-
-_HOME_SH = r'''#!/bin/bash
-# 停止会话 + 正规归零
+# 1) 停掉推理会话
 PAT='start_ex001[.]py'
 if pgrep -f "$PAT" >/dev/null; then
   kill $(pgrep -f "$PAT") 2>/dev/null
@@ -406,12 +426,13 @@ if pgrep -f "$PAT" >/dev/null; then
 fi
 rm -f /tmp/xr.pid
 sleep 1
+# 2) 走官方 zero_arm 正规归零（controller mode 11）
 source /opt/xr/bot/x2robot_client/share/x2robot_client/scripts/session_env.sh >/dev/null 2>&1
 OUT=$(python3 -m x2robot_client.zero_arm --timeout 90 2>&1)
 if echo "$OUT" | grep -q "homing complete"; then
-  echo "已归零（注意：夹爪里的东西还在）"
+  echo "已停止，双臂归零完成"
 else
-  echo "归零未确认："
+  echo "已停止，但归零未确认："
   echo "$OUT" | tail -3
 fi
 '''
@@ -421,7 +442,7 @@ def ensure_scripts():
     if not KEY:
         return "⚠️ 没读到 WALLX_API_KEY"
     parts = []
-    for path, body in ((HELPER, _D3_SH.replace("__KEY__", KEY)), (STOP_SH, _STOP_SH), ("/tmp/home.sh", _HOME_SH)):
+    for path, body in ((HELPER, _D3_SH.replace("__KEY__", KEY)), (STOP_SH, _STOP_SH)):
         b = base64.b64encode(body.encode()).decode()
         parts.append(f"echo '{b}' | base64 -d > {path} && chmod +x {path}")
     return shell_text(" && ".join(parts) + " && bash -n /tmp/d3.sh && echo '脚本就绪'").strip()
@@ -919,8 +940,10 @@ h1{font-size:15px;margin:0;font-weight:600}
 .tag.on{background:#123a24;color:#4ade80}.tag.off{background:#232833;color:#8b93a7}
 .wrap{display:grid;grid-template-columns:1.15fr 1fr;gap:16px;padding:16px;max-width:1720px;margin:0 auto}
 @media(max-width:1100px){.wrap{grid-template-columns:1fr}}
-.cams{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.cams{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+.cams>div:nth-child(4),.cams>div:nth-child(5){grid-column:span 1.5}
 .cam{background:#161922;border:1px solid #262b38;border-radius:12px;overflow:hidden;position:relative}
+.cam.main{border-color:#3b6ea5;box-shadow:0 0 0 1px #3b6ea5 inset}
 .cam .lbl{position:absolute;top:8px;left:10px;font-size:11px;background:#000a;padding:2px 8px;border-radius:6px;color:#cfd6e6}
 .cam img{display:block;width:100%;height:auto;min-height:150px;object-fit:cover;background:#0b0d12}
 .cam .ph{display:flex;align-items:center;justify-content:center;height:170px;color:#5a6376;font-size:12px}
@@ -988,14 +1011,16 @@ button.go{background:#176a58}button.stop{background:#7b2633;color:#fff;border-co
 details>summary{cursor:pointer;color:#b7c8dd;font-weight:600;padding:4px 0}details[open]>summary{margin-bottom:12px}
 #log{max-height:220px}small{color:#98acc3}.scanbox{background:#111c28}#scancode{font-size:25px}
 @media(max-width:1000px){.wrap{grid-template-columns:1fr;padding:12px}header{padding:10px}.cam:first-child img{max-height:none}}
+#teachpanel{scroll-margin-top:100px;border:2px solid #61d6bb}
+#teachpanel:target{box-shadow:0 0 0 4px #61d6bb35}
+.teach-link{color:#a9ffe5;background:#164f43;border:1px solid #61d6bb;border-radius:9px;padding:10px 15px;text-decoration:none;font-weight:600}
 </style></head><body>
 <header>
   <h1>BRIGHT / 扫码分拣工作台</h1>
-  <span class=tag>10.230.20.13 · ex001-655 · 工位27</span>
+  <a class=teach-link href="#teachpanel">拖动示教 · 点这里</a>
+  <span class=tag>量子1号 Pro · 本地控制台</span>
   <span class=tag id=st>状态检测中…</span>
   <span class=tag id=gr>夹爪 -- / --</span>
-  <a href="/twin" target=_blank style="margin-left:auto;color:#8fc2ff;text-decoration:none;
-     border:1px solid #2e3543;border-radius:9px;padding:8px 14px;font-size:13px">🧊 3D 孪生</a>
   <button class=ghost onclick="stopOnly()">■ 停止（臂不动）</button>
   <button class=stop onclick="stopIt()">⌂ 停止 + 归零</button>
   <button onclick="holdStop()">停止推理（不归零）</button>
@@ -1006,6 +1031,20 @@ details>summary{cursor:pointer;color:#b7c8dd;font-weight:600;padding:4px 0}detai
     <section><h2>运行日志</h2><pre id=log>加载中…</pre></section>
   </div>
   <div>
+    <section id=teachpanel>
+      <h2>拖动示教（用手带动机械臂） <span class=tag id=teachStatus>读取中</span></h2>
+      <p id=teachHelp>读取状态中；这不是键盘方向控制。</p>
+      <small>空爪、现场支撑双臂；显示“可拖动”后再轻缓引导。</small>
+      <label style="display:block;margin-top:8px"><input type=checkbox id=teachReady> 已在现场准备好</label>
+      <div class=row>
+        <button id=teachEnter onclick="teachAct('enter')" disabled>进入拖动</button>
+        <button id=teachRecord onclick="teachAct('record-start')" disabled>开始录制</button>
+        <button id=teachEnd onclick="teachAct('record-stop')" disabled>结束录制</button>
+        <button id=teachExit onclick="teachAct('exit')" disabled>退出拖动</button>
+      </div>
+      <div id=teachMsg class=msg role=status></div>
+      <details><summary>录制详情</summary><pre id=teachDetails></pre></details>
+    </section>
     <section id=permissions>
       <h2>① 车身权限（决定它能不能弯腰/低头/走近）</h2>
       <div class=modes id=modes></div>
@@ -1017,6 +1056,11 @@ details>summary{cursor:pointer;color:#b7c8dd;font-weight:600;padding:4px 0}detai
       <div class=row>
         <input type=text id=instr placeholder="例如: place the product into the empty hole of the tray">
         <button class=go onclick="runCustom()">下发</button>
+        <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#9fb3d1">
+          <input type="checkbox" id=autohome style="width:15px;height:15px;accent-color:#3b82f6">
+          跑完自动归零
+        </label>
+        <input type="text" id=aftersec value="120" style="width:60px;min-width:0;text-align:center">
       </div>
       <div class=msg id=msg></div>
     </section>
@@ -1060,8 +1104,42 @@ details>summary{cursor:pointer;color:#b7c8dd;font-weight:600;padding:4px 0}detai
 const GROUPS = __GROUPS__;
 const CAMS = __CAMS__;
 const MODES = __MODES__;
+let teachBusy=false;
+let robotInferRunning=true;
+let teachState=null;
+function teachButtons(){
+  const d=teachState||{},drag=d.execution_ready===true;
+  const rec=d.recording?.state;
+  document.getElementById('teachEnter').disabled=teachBusy||robotInferRunning||d.task_type!==0||!d.drag_controller?.loaded||!document.getElementById('teachReady').checked;
+  document.getElementById('teachHelp').textContent=d.execution_warning|| (robotInferRunning?
+    '推理正在运行：先点顶部“停止（臂不动）”，再进入拖动。':
+    '勾选“已在现场准备好”后点“进入拖动”；显示“可拖动”后才能用手引导。');
+  document.getElementById('teachRecord').disabled=teachBusy||!drag||[1,2,3].includes(rec);
+  document.getElementById('teachEnd').disabled=teachBusy||![1,2].includes(rec);
+  document.getElementById('teachExit').disabled=teachBusy||d.task_type!==23||[1,2,3].includes(rec);
+}
+document.getElementById('teachReady').onchange=teachButtons;
+async function teachPoll(){
+  try{const r=await fetch('/teach/state');if(!r.ok)throw new Error('读取失败');
+    teachState=await r.json();const d=teachState;
+    document.getElementById('teachStatus').textContent=d.drag?.error_code?'拖动错误 '+d.drag.error_code:
+      d.execution_ready?'可拖动':!d.drag_controller?.loaded?'执行端未配置':d.task_type===23?'等待执行端就绪':'未开启';
+    const labels={0:'空闲',1:'准备录制',2:'录制中',3:'保存中',4:'文件完成',5:'录制失败'};
+    document.getElementById('teachDetails').textContent=(labels[d.recording?.state]||'状态未知')+'\n'+JSON.stringify(d.recording,null,2);
+  }catch(e){teachState=null;document.getElementById('teachStatus').textContent='连接失败';}
+  teachButtons();setTimeout(teachPoll,1800);
+}
+async function teachAct(action){
+  if(teachBusy)return;teachBusy=true;teachButtons();
+  const el=document.getElementById('teachMsg');el.textContent='等待确认…';
+  try{const r=await fetch('/teach/'+action,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});const d=await r.json();
+    if(!r.ok||d.ok===false)throw new Error(d.message||d.error||'操作失败');
+    el.textContent=d.message||(action==='record-start'?'录制已请求':action==='record-stop'?'保存已请求':'完成');
+  }catch(e){el.textContent=e.message;}finally{teachBusy=false;teachButtons();}
+}
+teachPoll();
 const taskPanel=document.getElementById('taskpanel');
-taskPanel.parentElement.prepend(taskPanel);
+taskPanel.parentElement.insertBefore(taskPanel, document.getElementById('permissions'));
 const permissions=document.getElementById('permissions');
 const more=document.createElement('details');
 const summary=document.createElement('summary');summary.textContent='高级设置 · 车身权限 / 实验模式';
@@ -1080,7 +1158,8 @@ MODES.forEach(([k,label,hint]) => {
 // 相机
 const cams = document.getElementById('cams');
 CAMS.forEach(([dev,label]) => {
-  const d = document.createElement('div'); d.className='cam';
+  const d = document.createElement('div');
+  d.className = 'cam' + (String(label).includes('主视角') ? ' main' : '');
   d.innerHTML = `<div class=lbl>${label}</div><div class=ph id=ph${dev}>连接中…</div>` +
                 `<img id=img${dev} style="display:none">`;
   cams.appendChild(d);
@@ -1111,7 +1190,12 @@ function msg(t){document.getElementById('msg').textContent=t;}
 async function post(p,b){const r=await fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});return r.json();}
 async function send(instr){
   msg('下发中: '+instr);
-  const d=await post('/run',{instruction:instr, mode:curMode, use_agent:document.getElementById('agent').checked});
+  const ah = document.getElementById('autohome');
+  const as = document.getElementById('aftersec');
+  const d=await post('/run',{instruction:instr, mode:curMode,
+    use_agent:document.getElementById('agent').checked,
+    auto_home: !!(ah && ah.checked),
+    home_after: as ? parseFloat(as.value)||120 : 120});
   msg((d.ok?'✅ ':'❌ ')+(d.message||''));
   setTimeout(refresh,1200);
 }
@@ -1185,11 +1269,11 @@ async function editRules(){
 }
 scanTick();
 
-async function stopIt(){msg('停止并归零中…');const d=await post('/home',{});msg((d.ok?'✅ ':'❌ ')+(d.message||''));setTimeout(refresh,600);}
-async function stopOnly(){msg('停止中…');const d=await post('/stop',{});msg((d.ok?'✅ ':'❌ ')+(d.message||''));setTimeout(refresh,400);}
+async function stopIt(){msg('停止中…');const d=await post('/stop',{});msg((d.ok?'✅ ':'❌ ')+(d.message||''));setTimeout(refresh,400);}
 async function refresh(){
   try{
     const d = await (await fetch('/state')).json();
+    robotInferRunning=!!d.running;teachButtons();
     const st=document.getElementById('st');
     st.textContent = d.running ? ('运行中 '+d.uptime) : '空闲';
     st.className='tag '+(d.running?'on':'off');
@@ -1230,7 +1314,21 @@ class Handler(BaseHTTPRequestHandler):
                         .replace("__CAMS__", json.dumps(list(CAMS.items()), ensure_ascii=False))
                         .replace("__MODES__", json.dumps(modes, ensure_ascii=False)))
             self._send(200, page, "text/html")
+        elif self.path == "/teach/state":
+            try:
+                native_teach.ROBOT = ROBOT_IP
+                self._send(200, json.dumps(native_teach.status(), ensure_ascii=False))
+            except Exception as exc:
+                self._send(502, json.dumps({"error": str(exc)}, ensure_ascii=False))
         elif self.path.startswith("/snap"):
+            mw = re.search(r"[?&]d=(wa|wb)", self.path)
+            if mw:
+                data = robot_get(f"/wrist?k={mw.group(1)[1]}")
+                if data:
+                    self._send(200, data, "image/jpeg")
+                else:
+                    self._send(404, b"", "image/jpeg")
+                return
             m = re.search(r"[?&]d=(\d+)", self.path)
             dev = int(m.group(1)) if m else 8
             data = robot_get(f"/snap?d={dev}") or snapshot(dev)
@@ -1295,7 +1393,23 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:  # noqa: BLE001
             data = {}
         try:
-            if self.path == "/flow/start":
+            if self.path in ('/run', '/home', '/flow/start') and not (self.path == '/flow/start' and data.get('dry_run', True)):
+                native_teach.ROBOT = ROBOT_IP
+                if native_teach.task().get('type') == 23:
+                    raise ValueError('请先退出零力拖动，再执行机器人动作')
+            if self.path.startswith('/teach/'):
+                origin = self.headers.get('Origin')
+                if origin and origin != 'http://' + self.headers.get('Host', ''):
+                    return self._send(403, '{}')
+                action = self.path.rsplit('/', 1)[-1]
+                if action == 'enter' and FLOW.active():
+                    raise ValueError('先取消自动流程')
+                if action == 'enter' and status().get('running'):
+                    raise ValueError('先停止推理会话')
+                native_teach.ROBOT = ROBOT_IP
+                result = native_teach.perform(action)
+                self._send(200, json.dumps({"ok": True, **result}, ensure_ascii=False))
+            elif self.path == "/flow/start":
                 FLOW.start(data)
                 self._send(200, json.dumps({"ok": True, "message": "流程已启动"}, ensure_ascii=False))
             elif self.path == "/flow/cancel":
@@ -1310,7 +1424,16 @@ class Handler(BaseHTTPRequestHandler):
                 instr = (data.get("instruction") or "").strip()
                 if not instr:
                     return self._send(200, json.dumps({"ok": False, "message": "指令为空"}))
-                self._send(200, json.dumps({"ok": True, "message": run_instruction(instr, data.get("mode") or "full", bool(data.get("use_agent")))},
+                msg = run_instruction(instr, data.get("mode") or "full", bool(data.get("use_agent")))
+                if data.get("auto_home"):
+                    import threading as _th, time as _t
+                    def _later():
+                        _t.sleep(float(data.get("home_after") or 120))
+                        try: home_all()
+                        except Exception: pass
+                    _th.Thread(target=_later, daemon=True).start()
+                    msg += f"（{int(data.get('home_after') or 120)} 秒后自动归零）"
+                self._send(200, json.dumps({"ok": True, "message": msg},
                                            ensure_ascii=False))
             elif self.path == "/home":
                 self._send(200, json.dumps({"ok": True, "message": home_all()},
@@ -1397,20 +1520,20 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ip", default=ROBOT_IP)
     ap.add_argument("--port", type=int, default=8900)
-    ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument("--host", default="127.0.0.1")
     a = ap.parse_args()
     ROBOT_IP = a.ip
     _ep = f"http://{ROBOT_IP}:{PORTAINER_PORT}/api"
 
     print("=" * 60)
     print("  🍭 超级棒棒糖 · 量子1号 Pro 通用控制台")
-    print(f"  机器人  {ROBOT_IP}  (ex001-655 / 工位27)")
+    print(f"  机器人  {ROBOT_IP}")
     print(f"  打开    http://localhost:{a.port}")
     print("=" * 60)
     def startup_checks():
         try:
             print("  连接:", (shell_text("echo pong", timeout=12) or "").strip() or "无响应")
-            print("  脚本:", ensure_scripts())
+            print("  动作脚本: 保留现有配置")
             print("  感知容器:", find_perception_container() or "未找到")
             print("  腕部守护:", ensure_wrist_daemon(), "(2=两张图就绪)")
         except Exception as e:
